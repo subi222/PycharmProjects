@@ -1,6 +1,27 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+import matplotlib.pyplot as plt
+from scipy.signal import welch, find_peaks
+from scipy.signal import spectrogram
+import os
+import glob
+import re
+import pandas as pd
+
+
+
+ROOT = "/home/subi/PycharmProjects/Cohface"
+
+def get_session0_avis(root=ROOT):
+    paths = glob.glob(os.path.join(root, "cohface*", "*", "0", "data.avi"))
+    # 숫자 client-id 정렬 (1,2,3,...,40)
+    def client_id_key(p):
+        # .../cohfaceX/<client-id>/0/data.avi
+        m = re.search(r"/cohface\d+/(\d+)/0/data\.avi$", p)
+        return int(m.group(1)) if m else 10**9
+    return sorted(paths, key=client_id_key)
+
 
 def moving_average_1s(signal: np.ndarray, fps: float) -> np.ndarray:
     """1초 창 크기의 이동평균을 적용."""
@@ -31,10 +52,7 @@ def landmarks_to_bbox(landmarks, w, h):
 
 def define_rois_from_bbox(bbox, w, h):
     """
-    FaceMesh 전체 박스 기준으로 두 개의 직사각형 ROI를 정의.
-    - Forehead: 상단 중앙부
-    - Nose: 중앙부(코 근처)
-    비율(경험적): 너비 0.30/0.22, 높이 0.15/0.20
+    FaceMesh 전체 박스 기준으로 두 개의 직사각형 ROI를 정의. 비율:너비 0.30/0.22, 높이 0.15/0.20
     """
     x_min, y_min, x_max, y_max = bbox
     bw, bh = (x_max - x_min), (y_max - y_min)
@@ -91,8 +109,6 @@ def interpolate_nans(arr: np.ndarray) -> np.ndarray:
     arr_interp[~mask] = np.interp(x[~mask], x[mask], arr[mask])
     return arr_interp
 
-import numpy as np
-
 def percentile_threshold(abs_signal: np.ndarray, p: float = 90.0) -> float:
     """
     절대값 신호의 상위 p%에 해당하는 동적 임계값 계산.
@@ -104,22 +120,6 @@ def percentile_threshold(abs_signal: np.ndarray, p: float = 90.0) -> float:
 
 def kurtosis_noise_suppress(vel: np.ndarray, fps: float, p: float = 90.0,
                             pad_sec: float = 0.10) -> tuple[np.ndarray, dict]:
-    """
-    [2. 잡음 제거 단계]
-    - 절대 속도 신호의 상위 p% (기본 90%) 값을 임계값으로 사용
-    - |vel| >= T 인 지점(노이즈 버스트)을 0으로 처리
-    - 너무 뾰족한 스파이크만 제거하고 싶다면 pad_sec을 작게(0~0.1s) 유지
-
-    Args:
-        vel: 속도 신호 (차분 결과)
-        fps: 프레임레이트
-        p:   퍼센타일(기본 90)
-        pad_sec: 노이즈 점 주변으로 추가로 묶어줄 패딩 길이(초). ex) 0.10s
-
-    Returns:
-        clean: 0으로 눌러 제거된 속도 신호
-        info:  {'threshold': T, 'noise_ratio': ..., 'mask': ...}
-    """
     if len(vel) == 0:
         return vel, {'threshold': 0.0, 'noise_ratio': 0.0, 'mask': np.zeros(0, dtype=bool)}
 
@@ -149,11 +149,6 @@ def kurtosis_noise_suppress(vel: np.ndarray, fps: float, p: float = 90.0,
 
 # --- 3단계: Savitzky-Golay 필터 ---
 def savgol_2s(signal: np.ndarray, fps: float, polyorder: int = 2) -> np.ndarray:
-    """
-    2초 길이 창(window_length=round(2*fps))에 차수 2의 Savitzky-Golay 필터 적용.
-    - window_length는 홀수여야 하므로 짝수면 +1
-    - 신호 길이가 창보다 짧으면 창을 자동 축소
-    """
     from scipy.signal import savgol_filter
 
     if len(signal) == 0:
@@ -172,7 +167,7 @@ def savgol_2s(signal: np.ndarray, fps: float, polyorder: int = 2) -> np.ndarray:
 # --- 4단계: Welch PSD 기반 SNR 계산 ---
 def psd_snr(signal: np.ndarray,
             fs: float,
-            band: tuple = (0.1, 0.7),     # 호흡대역(Hz) ≈ 6~42 BPM
+            band: tuple = (0.1, 0.5),     # 호흡대역(Hz) ≈ 6~42 BPM
             nperseg_sec: float = 8.0,     # Welch 창 길이(초)
             peak_bw: float = 0.05         # 피크 주변 대역폭(±Hz) → 신호파워 집계
             ) -> dict:
@@ -226,19 +221,16 @@ def psd_snr(signal: np.ndarray,
 def combine_by_snr(sig_a: np.ndarray, sig_b: np.ndarray, fs: float,
                    band: tuple = (0.1, 0.7)) -> tuple[np.ndarray, dict]:
     """
-    두 신호를 z-score 정규화 후, Welch-PSD 기반 SNR을 가중치로 사용해 통합.
+    두 신호를 그대로 사용하고, Welch-PSD 기반 SNR을 가중치로 사용해 통합.
     - 가중치 = SNR / (SNR_a + SNR_b). (합이 0이면 0.5/0.5)
     반환: (combined, info)
       info = {'w_a':..., 'w_b':..., 'snr_a':..., 'snr_b':..., 'peak_a':..., 'peak_b':...}
     """
-    def zscore(x):
-        x = np.asarray(x, dtype=float)
-        mu, sd = np.mean(x), np.std(x) + 1e-8
-        return (x - mu) / sd
+    # 신호 그대로 사용
+    a = np.asarray(sig_a, dtype=float)
+    b = np.asarray(sig_b, dtype=float)
 
-    a = zscore(sig_a)
-    b = zscore(sig_b)
-
+    # 각 신호의 SNR 계산
     info_a = psd_snr(a, fs=fs, band=band)
     info_b = psd_snr(b, fs=fs, band=band)
 
@@ -250,6 +242,7 @@ def combine_by_snr(sig_a: np.ndarray, sig_b: np.ndarray, fs: float,
         w_a = float(snr_a / s)
         w_b = float(snr_b / s)
 
+    # 가중합
     combined = w_a * a + w_b * b
     info = {
         'w_a': w_a, 'w_b': w_b,
@@ -259,7 +252,7 @@ def combine_by_snr(sig_a: np.ndarray, sig_b: np.ndarray, fs: float,
     }
     return combined, info
 
-def process_video(video_path: str, draw_preview: bool = False):
+def process_video(video_path: str, draw_preview: bool = False, save_csv: bool = False, out_dir: str = "./results/motion_signals"):
     mp_face_mesh = mp.solutions.face_mesh
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -284,9 +277,7 @@ def process_video(video_path: str, draw_preview: bool = False):
 
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
-
+            if not ret:break
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = face_mesh.process(rgb)
 
@@ -371,36 +362,37 @@ def process_video(video_path: str, draw_preview: bool = False):
         "motion_resp_signal": motion_resp_signal,
         "snr_info": snr_info,
     }
+
+    if save_csv:
+        os.makedirs(out_dir, exist_ok=True)
+        sid = _extract_subject_id(video_path)
+        t = np.arange(len(motion_resp_signal)) / fps
+        pd.DataFrame({"t_sec": t, "motion_resp_signal": motion_resp_signal}) \
+            .to_csv(os.path.join(out_dir, f"{sid}.csv"), index=False)
+        print(f"✅ Saved motion signal: {os.path.join(out_dir, f'{sid}.csv')}")
+
     return out
 
+def _extract_subject_id(video_path: str) -> str:
+    m = re.search(r"/cohface\d+/(\d+)/0/data\.avi$", video_path)
+    return m.group(1) if m else os.path.splitext(os.path.basename(video_path))[0]
+
+def process_multiple_videos(video_paths, draw_preview=False,
+                            save_csv=False, out_dir="./results/motion_signals"):
+    results = {}
+    for idx, path in enumerate(video_paths, 1):
+        print(f"[{idx}/{len(video_paths)}] Processing: {path}")
+        try:
+            results[path] = process_video(path,
+                                          draw_preview=draw_preview,
+                                          save_csv=save_csv,
+                                          out_dir=out_dir)
+        except Exception as e:
+            print(f" {path} 처리 실패: {e}")
+    return results
+
+
 if __name__ == "__main__":
-    #  여기에 COHFACE 비디오 경로를 넣으세요
-    VIDEO_PATH = "/home/subi/PycharmProjects/data.avi"
-    result = process_video(VIDEO_PATH, draw_preview=False)
-
-    # 간단 통계
-    for k, v in result.items():
-        if isinstance(v, np.ndarray):
-            print(f"{k}: shape={v.shape}, mean={np.mean(v):.4f}, std={np.std(v):.4f}")
-        else:
-            print(f"{k}: {v}")
-
-    # === 호흡신호(파이프라인 결과)만 저장/확인 ===
-    resp = result["motion_resp_signal"]
-    np.save("resp_signal.npy", resp)
-    np.savetxt("resp_signal.csv", resp, delimiter=",")
-    print(f"Respiratory signal saved: len={len(resp)}, fs={result['fps']:.2f} Hz")
-    print(f"resp mean={np.mean(resp):.4f}, std={np.std(resp):.4f}")
-
-    import matplotlib.pyplot as plt
-
-    t = np.arange(len(resp)) / result["fps"]
-    plt.figure(figsize=(10, 3))
-    plt.plot(t, resp)
-    plt.xlabel("Time (s)");
-    plt.ylabel("Resp signal (a.u.)");
-    plt.tight_layout()
-    plt.savefig("resp_signal.png", dpi=200)
-    # plt.show()
-
-
+    video_paths = get_session0_avis(ROOT)
+    all_results = process_multiple_videos(video_paths, draw_preview=False,save_csv=True, out_dir="./results/motion_signals")
+    print("총 처리 완료:", len(all_results), "개")

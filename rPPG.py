@@ -5,6 +5,21 @@ from sklearn.mixture import GaussianMixture
 from scipy.signal import butter, filtfilt, welch, find_peaks, detrend, resample
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
+import re
+import pandas as pd
+import glob
+
+
+ROOT = "/home/subi/PycharmProjects/Cohface"
+
+def get_session0_avis(root=ROOT):
+    paths = glob.glob(os.path.join(root, "cohface*", "*", "0", "data.avi"))
+    # 숫자 client-id 정렬 (1,2,3,...,40)
+    def client_id_key(p):
+        # .../cohfaceX/<client-id>/0/data.avi
+        m = re.search(r"/cohface\d+/(\d+)/0/data\.avi$", p)
+        return int(m.group(1)) if m else 10**9
+    return sorted(paths, key=client_id_key)
 
 # 유틸: 신호처리 필터
 def butter_bandpass(low, high, fs, order=3):
@@ -22,7 +37,6 @@ def softmax(x, tau=1.0):
     z = (x - np.max(x)) / max(1e-8, tau)
     e = np.exp(z)
     return e / np.sum(e)
-
 
 # 0단계: 비디오 로딩 & 얼굴 검출
 def read_video(path, max_frames=None):
@@ -119,7 +133,7 @@ def step1_rppg(frames_rgb, fs, top_k=32, roi_size=(16,16)):
     for _, rx, ry, rw, rh in top_rois:
         sig = extract_chrom_signal(face_crops, (rx, ry, rw, rh))
         roi_signals.append(sig)
-    roi_signals = np.array(roi_signals)  # [K, T]
+    roi_signals = np.array(roi_signals)  # [ROI 개수 K, 프레임 수 T]
     return roi_signals, (x,y,w,h), prob_map, top_rois
 
 
@@ -152,9 +166,8 @@ def step2_denoise_and_fuse(roi_signals, fs):
     fused = np.average(roi_bp, axis=0, weights=weights)
     return fused, snrs, weights
 
-# -----------------------------
+
 # 3단계: IBI 추출 (피크 간 간격)
-# -----------------------------
 def step3_ibi_from_peaks(rppg_fused, fs, hr_min=40, hr_max=180):
     # 피크 간 최소 거리 제약 (최소 HR 기준)
     min_dist = int(fs * 60.0 / hr_max)  # 샘플
@@ -165,9 +178,8 @@ def step3_ibi_from_peaks(rppg_fused, fs, hr_min=40, hr_max=180):
     ibi = np.diff(beat_times) * 1000.0  # ms
     return beat_times, ibi
 
-# -----------------------------
+
 # 4단계: 후처리 (선형 추세 제거, 균일 보간 등)
-# -----------------------------
 def step4_postprocess_ibi_to_resp(beat_times, ibi_ms, target_len, target_fs):
     if len(ibi_ms) == 0:
         return np.zeros(target_len)
@@ -188,10 +200,17 @@ def step4_postprocess_ibi_to_resp(beat_times, ibi_ms, target_len, target_fs):
     resp_filt = bandpass_filter(resp_like, target_fs, 0.08, 0.5, order=2)
     return resp_filt
 
-# -----------------------------
+
 # 5단계: 파이프라인 메인
-# -----------------------------
-def process_video_to_resp_signal(video_path, max_frames=None, visualize=True):
+def extract_subject_id(video_path: str) -> str:
+    """
+    경로에서 subject id 추출
+    예) /.../cohface3/27/0/data.avi -> '27'
+    """
+    m = re.search(r"/cohface\d+/(\d+)/0/data\.avi$", video_path)
+    return m.group(1) if m else os.path.splitext(os.path.basename(video_path))[0]
+
+def process_video(video_path, max_frames=None, visualize=True, save_csv=True, out_dir="/home/subi/PycharmProjects/results/rPPG_signals"):
     frames_rgb, fs = read_video(video_path, max_frames=max_frames)
 
     # 1단계: rPPG 추출 (GMM 피부 + 상위 32 ROI + CHROM)
@@ -223,42 +242,30 @@ def process_video_to_resp_signal(video_path, max_frames=None, visualize=True):
         "resp_signal": resp_signal,            # [T] 최종 호흡 신호(정규화X)
     }
 
-    if visualize:
-        T = np.arange(len(rppg_fused))/fs
-        fig, axs = plt.subplots(4,1, figsize=(12,10), sharex=False)
-        axs[0].plot(T, rppg_fused)
-        axs[0].set_title("2단계 결과: 융합된 rPPG (0.7–3.0Hz)")
-        axs[0].set_xlabel("Time (s)")
-
-        if len(ibi_ms) > 0:
-            axs[1].plot(beat_times[1:], ibi_ms, marker='o')
-            axs[1].set_title("3단계: IBI (ms)")
-            axs[1].set_xlabel("Time (s)")
-            axs[1].set_ylabel("IBI (ms)")
-        else:
-            axs[1].text(0.5, 0.5, "IBI 추출 실패(피크 부족)", ha='center', va='center')
-            axs[1].set_axis_off()
-
-        axs[2].plot(T, detrend(rppg_fused, type='linear'))
-        axs[2].set_title("참고: rPPG 선형 detrend")
-        axs[2].set_xlabel("Time (s)")
-
-        axs[3].plot(T, resp_signal)
-        axs[3].set_title("5단계: 최종 호흡 신호 (IBI 기반 RSA)")
-        axs[3].set_xlabel("Time (s)")
-        plt.tight_layout()
-        plt.show()
+    if save_csv:
+        os.makedirs(out_dir, exist_ok=True)
+        sid = extract_subject_id(video_path)
+        t = np.arange(len(resp_signal)) / fs
+        df = pd.DataFrame({"t_sec": t, "resp_signal": resp_signal})
+        save_path = os.path.join(out_dir, f"{sid}.csv")
+        df.to_csv(save_path, index=False)
+        print(f" Saved rPPG signal: {save_path}")
 
     return out
 
-# -----------------------------
-# 실행 예시
-# -----------------------------
-if __name__ == "__main__":
-    VIDEO_PATH = "/home/subi/PycharmProjects/data.avi"  # COHFACE의 RGB 비디오 경로
-    result = process_video_to_resp_signal(VIDEO_PATH, max_frames=None, visualize=True)
+def process_multiple_videos(video_paths, max_frames=None, visualize=True):
+    results = {}
+    for idx, path in enumerate(video_paths, 1):
+        print(f"[{idx}/{len(video_paths)}] Processing: {path}")
+        try:
+            out = process_video(path, max_frames=max_frames, visualize=visualize)
+            results[path] = out
+        except Exception as e:
+            print(f"{path} 처리 실패: {e}")
+    return results
 
-    # 간단 로그
-    print(f"fps={result['fps']:.2f}, frames={result['frames']}")
-    print(f"IBI 개수: {len(result['ibi_ms'])}, 평균 IBI: {np.mean(result['ibi_ms']) if len(result['ibi_ms']) else np.nan:.1f} ms")
-    print(f"ROI SNR 평균: {np.mean(result['snrs']):.2f} dB")
+
+if __name__ == "__main__":
+    video_paths = get_session0_avis(ROOT)  # 40개 AVI 경로 가져오기
+    all_results = process_multiple_videos(video_paths,max_frames=None, visualize=False)
+    print("총 처리 완료:", len(all_results), "개")
