@@ -2,8 +2,14 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple, Optional
 from scipy.signal import get_window, detrend
-import os
+import os, h5py
 from pathlib import Path
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Optional, Tuple, List
+import glob
+
+
 
 def read_time_value_csv(path: str) -> Tuple[np.ndarray, float]:
     """2열 [time(sec), value] CSV → (value 신호, fs) 반환"""
@@ -153,8 +159,6 @@ def psd_peak_bpm(
         return None
     return float(f_peak * 60.0)
 
-import numpy as np
-import pandas as pd
 
 def br_series_from_raw_csv(input_csv: str,
                            win_sec: float = 30.0, hop_sec: float = 5.0,
@@ -240,6 +244,128 @@ def plot_motion_vs_rppg_pair(index_i: int,
         df.to_csv(out_csv, index=False)
         print(f"[ok] saved merged csv: {out_csv}")
 
+def _find_h5_for_index(cohface_root: str, idx: int, session: str = "0") -> Optional[str]:
+    """
+    /<root>/cohface*/<idx>/<session>/data.hdf5 를 검색해 첫 매치를 반환.
+    예: /home/subi/PycharmProjects/Cohface/cohface1/1/0/data.hdf5
+    """
+    pats = [
+        os.path.join(cohface_root, "cohface*", str(idx), session, "data.hdf5"),
+        os.path.join(cohface_root, "cohface*", f"{idx}", session, "data.hdf5"),
+    ]
+    for p in pats:
+        hits = sorted(glob.glob(p))
+        if hits:
+            return hits[0]
+    return None
+
+def _infer_fs_from_time(t: np.ndarray) -> float:
+    """time(초) 배열에서 fs 추정 (median Δt)."""
+    dt = np.diff(t)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return np.nan
+    return float(1.0 / np.median(dt))
+
+# ---------- 핵심: 한 파일 → br_gt 시계열 ----------
+def br_series_from_gt(idx: int,
+                      cohface_root: str,
+                      win_sec: float = 30.0,
+                      hop_sec: float = 5.0,
+                      br_min_bpm: float = 8.0, # ← 안 쓰이지만 호출 호환성용
+                      br_max_bpm: float = 30.0, # ← 안 쓰이지만 호출 호환성용
+                      time_mode: str = "hop",
+                      min_coverage_ratio: float = 0.5
+                      ) -> pd.DataFrame:
+
+    h5_path = _find_h5_for_index(cohface_root, idx, session="0")
+    if not h5_path or not os.path.exists(h5_path):
+        raise FileNotFoundError(f"GT HDF5 not found for idx={idx}: {h5_path}")
+
+    with h5py.File(h5_path, "r") as f:
+        # 데이터셋 이름은 COHFACE 표준: 'time', 'respiration' (둘 다 float)
+        t  = np.asarray(f["time"][:], dtype=float)
+        gt = np.asarray(f["respiration"][:], dtype=float)
+
+    # 안전 처리: 시간/신호 길이 맞추기 + 유효구간만 사용
+    n = min(len(t), len(gt))
+    t, gt = t[:n], gt[:n]
+    mask = np.isfinite(t) & np.isfinite(gt)
+    t, gt = t[mask], gt[mask]
+
+    if t.size < 2:
+        raise ValueError(f"Not enough GT samples in {h5_path}")
+
+    fs = _infer_fs_from_time(t)
+    if not np.isfinite(fs):
+        raise ValueError(f"Cannot infer fs from time in {h5_path}")
+
+    # --- 윈도우/홉 기반 시간축 구성 ---
+    t_start = float(t[0])
+    t_end   = float(t[-1])
+    win = float(win_sec)
+    hop = float(hop_sec)
+
+    # hop 모드: 5,10,15,... 형태의 고정 시간축(파일 기준으로는 t_start 이후로 맞춤)
+    # 관용적으로 5,10,…을 원하면 기준을 0으로 두고 생성 후 파일 범위 내만 사용
+    # 여기서는 window가 완전히 데이터 범위에 들어오는 지점까지만 생성
+    centers: List[float] = []
+    k = 1
+    while True:
+        tc = k * hop if time_mode == "hop" else (t_start + win/2 + (k-1)*hop)
+        w_start, w_end = tc - win/2, tc + win/2
+        # 윈도우가 데이터 범위에 완전히 들어오지 않으면 종료
+        if w_end > t_end or w_start < t_start:
+            if time_mode == "center":
+                break  # center 모드는 시작부터 범위 밖이면 바로 종료
+            # hop 모드에서는 w_end가 범위를 넘기면 종료
+            if w_end > t_end:
+                break
+        # 범위 내면 추가
+        centers.append(tc)
+        k += 1
+
+    # --- 각 창에서 평균(BPM) 산출 ---
+    br_vals: List[float] = []
+    for tc in centers:
+        w_start, w_end = tc - win/2, tc + win/2
+        sel = (t >= w_start) & (t < w_end)
+        if not np.any(sel):
+            br_vals.append(np.nan)
+            continue
+        # 커버리지 체크 (너무 빈약하면 NaN)
+        cov = sel.sum() / max(1, int(round(win * fs)))
+        if cov < min_coverage_ratio:
+            br_vals.append(np.nan)
+            continue
+        br_vals.append(float(np.nanmean(gt[sel])))
+
+    return pd.DataFrame({"t_sec": np.asarray(centers, dtype=float),
+                         "br_gt": np.asarray(br_vals, dtype=float)})
+
+# ---------- 배치: 1~40 저장 ----------
+def run_gt_batch(cohface_root: str,
+                 out_dir: str,
+                 start_idx: int = 1,
+                 end_idx: int = 40,
+                 win_sec: float = 30.0,
+                 hop_sec: float = 5.0,
+                 time_mode: str = "hop"):
+    """
+    각 참가자 idx(1..40)의 session0 GT → {out_dir}/{idx}_gt.csv 로 저장.
+    """
+    outp = Path(out_dir)
+    outp.mkdir(parents=True, exist_ok=True)
+
+    for i in range(start_idx, end_idx + 1):
+        try:
+            df = br_series_from_gt(i, cohface_root, win_sec, hop_sec, time_mode=time_mode)
+            csv_path = outp / f"{i}_gt.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[ok] {i}: {csv_path.name} (rows={len(df)})")
+        except Exception as e:
+            print(f"[fail] {i}: {e}")
+
 # ========= 전체 시계열 BR =========
 def estimate_br_series(
     signal: np.ndarray,
@@ -323,6 +449,10 @@ if __name__ == "__main__":
     out_plot_dir   = "/home/subi/PycharmProjects/BR_series/plots"
     out_merged_dir = "/home/subi/PycharmProjects/BR_series/merged"
     cohface_root   = "/home/subi/PycharmProjects/Cohface"
+    out_dir = "/home/subi/PycharmProjects/BR_series/gt"
+    run_gt_batch(cohface_root, out_dir,
+                 start_idx=1, end_idx=40,
+                 win_sec=30.0, hop_sec=5.0, time_mode="hop")
 
     run_compare_batch(
         motion_dir, rppg_dir,
